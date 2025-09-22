@@ -1,3 +1,250 @@
+import os
+import gc
+import asyncio
+import itertools
+from collections import deque
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+import torch_geometric.nn as pyg_nn
+from torch_geometric.loader import NeighborLoader
+from torch_geometric.datasets import Planetoid
+
+
+# --------- DDP SETUP ----------
+def setup_ddp():
+    try:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", timeout=torch.distributed.default_pg_timeout)
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        return local_rank
+    except Exception as e:
+        print(f"[Warning] DDP setup failed, falling back to single GPU. Error: {e}")
+        return 0
+
+
+# --------- MODEL ----------
+class OptimizedChaosNet(nn.Module):
+    def __init__(self, in_channels, out_channels, hidden_dim=128,
+                 gcn_layers=32, gat_layers=16, linear_layers=8):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # Progressive layer dims for deeper GCN
+        layer_dims = [hidden_dim] * gcn_layers
+        for i in range(1, gcn_layers):
+            if i % 8 == 0:
+                layer_dims[i] = min(hidden_dim * 2, layer_dims[i-1] + 32)
+
+        # GCN layers
+        self.gcn_layers = nn.ModuleList([
+            pyg_nn.GCNConv(in_channels if i == 0 else layer_dims[i-1],
+                           layer_dims[i]) for i in range(gcn_layers)
+        ])
+
+        # GAT layers
+        self.gat_layers = nn.ModuleList([
+            pyg_nn.GATConv(layer_dims[-1] if i == 0 else hidden_dim,
+                           hidden_dim // 4, heads=4,
+                           dropout=0.1, concat=True) for i in range(gat_layers)
+        ])
+
+        # MLP head
+        self.linear_layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(linear_layers)])
+        self.bn_layers = nn.ModuleList([nn.BatchNorm1d(hidden_dim) for _ in range(linear_layers)])
+        self.dropout = nn.Dropout(0.1)
+        self.out_layer = nn.Linear(hidden_dim, out_channels)
+
+    def forward(self, x, edge_index):
+        # Feature projection if needed
+        if x.size(1) != self.hidden_dim:
+            x = F.relu(nn.Linear(x.size(1), self.hidden_dim, device=x.device)(x))
+
+        # GCN tower w/ checkpointing
+        for i, gcn in enumerate(self.gcn_layers):
+            if i % 4 == 0 and self.training:
+                x = checkpoint(lambda g, x, ei: F.relu(g(x, ei)), gcn, x, edge_index)
+            else:
+                x = F.relu(gcn(x, edge_index))
+
+        # GAT tower
+        for i, gat in enumerate(self.gat_layers):
+            if i % 3 == 0 and self.training:
+                x = checkpoint(lambda g, x, ei: F.elu(g(x, ei)), gat, x, edge_index)
+            else:
+                x = F.elu(gat(x, edge_index))
+
+        # MLP head
+        for i, (lin, bn) in enumerate(zip(self.linear_layers, self.bn_layers)):
+            if i % 2 == 0 and self.training:
+                x = checkpoint(lambda l, b, x: F.relu(b(l(x))), lin, bn, x)
+            else:
+                x = F.relu(bn(lin(x)))
+            if i < len(self.linear_layers) - 1:
+                x = self.dropout(x)
+
+        return self.out_layer(x)
+
+
+# --------- MEMORY MONITOR ----------
+class MemoryMonitor:
+    def __init__(self, interval=1.0):
+        self.interval = interval
+        self.stats = deque(maxlen=100)
+
+    async def monitor(self):
+        while True:
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                resv = torch.cuda.memory_reserved() / 1024**3
+                self.stats.append((alloc, resv))
+            await asyncio.sleep(self.interval)
+
+    def get_avg(self):
+        if not self.stats:
+            return (0, 0)
+        alloc = sum(x[0] for x in self.stats) / len(self.stats)
+        resv = sum(x[1] for x in self.stats) / len(self.stats)
+        return alloc, resv
+
+
+# --------- REPTILE TICKER ----------
+async def reptile_ticker(total_steps, delay=1):
+    reptiles = ["🐍 Snake", "🦎 Lizard", "🐢 Turtle", "🐊 Crocodile", "🐊 Alligator"]
+    for i, reptile in enumerate(itertools.cycle(reptiles), 1):
+        if i % 10 == 0:
+            mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            print(f"[Ticker] Step {i}: {reptile} | GPU Memory: {mem:.2f} GB")
+        if i >= total_steps:
+            break
+        await asyncio.sleep(delay)
+
+
+# --------- MAIN TRAINING ----------
+def main():
+    local_rank = setup_ddp()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    dataset = Planetoid(root="/tmp/Cora", name="Cora")
+    data = dataset[0].to(device)
+
+    # Build model
+    model = OptimizedChaosNet(dataset.num_node_features, dataset.num_classes).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=False)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4, betas=(0.9, 0.999))
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    scaler = GradScaler()
+
+    train_loader = NeighborLoader(
+        data,
+        input_nodes=data.train_mask,
+        num_neighbors=[20, 15, 10],
+        batch_size=64,
+        shuffle=True,
+        num_workers=2,
+        persistent_workers=True
+    )
+
+    epochs = 100
+    grad_accum_steps = 2
+    memory_monitor = MemoryMonitor()
+
+    async def train_loop():
+        ticker_task = asyncio.create_task(reptile_ticker(epochs * len(train_loader)))
+        mem_task = asyncio.create_task(memory_monitor.monitor())
+
+        for epoch in range(epochs):
+            model.train()
+            optimizer.zero_grad()
+            total_loss = 0
+
+            for i, batch in enumerate(train_loader):
+                batch = batch.to(device)
+                with autocast():
+                    out = model(batch.x, batch.edge_index)
+                    loss = criterion(out[batch.train_mask], batch.y[batch.train_mask])
+                    loss = loss / grad_accum_steps
+
+                scaler.scale(loss).backward()
+
+                if (i + 1) % grad_accum_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+
+                total_loss += loss.item() * grad_accum_steps
+
+                if local_rank == 0 and (i + 1) % 50 == 0:
+                    lr = scheduler.get_last_lr()[0]
+                    alloc, resv = memory_monitor.get_avg()
+                    print(f"[Epoch {epoch+1} Step {i+1}] "
+                          f"Loss: {total_loss/(i+1):.4f}, LR: {lr:.6f}, "
+                          f"GPU: {alloc:.2f}/{resv:.2f} GB")
+
+            # Validation at end of epoch
+            if local_rank == 0:
+                model.eval()
+                with torch.no_grad():
+                    out = model(data.x, data.edge_index)
+                    val_loss = criterion(out[data.val_mask], data.y[data.val_mask])
+                    pred = out.argmax(dim=1)
+                    val_acc = (pred[data.val_mask] == data.y[data.val_mask]).float().mean().item()
+                    print(f"[Epoch {epoch+1}] Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+                model.train()
+
+            # Manual memory cleanup
+            if epoch % 5 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        ticker_task.cancel()
+        mem_task.cancel()
+
+    asyncio.run(train_loop())
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
 # Creating an 87 billion parameter model for predicting complex network behaviors is theoretically possible. Here's a simplified example:
 
 # Chaos Network Simulation Model
@@ -768,3 +1015,4 @@ while True:
 
     import time
     time.sleep(1)
+"""
